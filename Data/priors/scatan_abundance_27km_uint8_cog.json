@@ -1,0 +1,11 @@
+{
+  "species": "scatan",
+  "product": "abundance",
+  "resolution": "27km",
+  "bands": 52,
+  "dtype": "uint8",
+  "scale": 0.00392156862745098,
+  "offset": 0.0,
+  "source": "scatan_abundance_lower_27km_2022.tif",
+  "year": "2022"
+}

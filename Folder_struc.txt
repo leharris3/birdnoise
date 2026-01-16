@@ -1,0 +1,6 @@
+Folder Structure BirdNoise
+
+-> BirdNoise
+	-> Data
+	-> Scripts
+	-> Example_notebook.ipynb

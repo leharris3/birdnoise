@@ -1,0 +1,137 @@
+model:
+  llama_path: "meta-llama/Meta-Llama-3.1-8B-Instruct"
+  beats_path: "path/to/BEATs_iter3_plus_AS2M_finetuned_on_AS2M_cpt2.pt"
+  ckpt: ""
+
+  flash_attn: flash_attention_2
+
+  freeze_beats: False
+
+  use_audio_Qformer: True
+  max_pooling: False
+  downsample_factor: 8
+  freeze_audio_QFormer: False
+  window_level_Qformer: True
+  num_audio_query_token: 1
+  second_per_window: 0.333333
+  second_stride: 0.333333
+
+  audio_llama_proj_model: ""
+  freeze_audio_llama_proj: False
+
+  lora: True
+  lora_rank: 32
+  lora_alpha: 32
+  lora_dropout: 0.1
+
+  multi_prompt: True
+  prompt_template: "<|start_header_id|>user<|end_header_id|>\n\n{}<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n"
+  prompt_path: "NatureLM/prompts/train_prompt.json"
+  test_prompt_path: "NatureLM/prompts/test_prompt.json"
+  max_txt_len: 200
+  end_sym: <|end_of_text|>
+
+  beats_cfg:
+    input_patch_size: 16
+    embed_dim: 512
+    conv_bias: False
+    encoder_layers: 12
+    encoder_embed_dim: 768
+    encoder_ffn_embed_dim: 3072
+    encoder_attention_heads: 12
+    activation_fn: "gelu"
+    layer_wise_gradient_decay_ratio: 0.6
+    layer_norm_first: False
+    deep_norm: True
+    dropout: 0.0
+    attention_dropout: 0.0
+    activation_dropout: 0.0
+    encoder_layerdrop: 0.05
+    dropout_input: 0.0
+    conv_pos: 128
+    conv_pos_groups: 16
+    relative_position_embedding: True
+    num_buckets: 320
+    max_distance: 800
+    gru_rel_pos: True
+    finetuned_model: True
+    predictor_dropout: 0.0
+    predictor_class: 527
+
+datasets:
+  train_ann_path: "/path/tp/classification_only_train_no_inat_valid.jsonl"
+  valid_ann_path: "/path/tp/classification_only_eval_no_inat_valid.jsonl"
+  test_ann_path: "/path/tp/classification_only_eval_no_inat_valid.jsonl"
+
+  audio_max_length_seconds: 10
+
+run:
+  seed: 13
+  output_dir: "out"
+  evaluate: False # if True, only evaluate model on test data
+
+  log_freq: 5
+  epoch_based: false
+  iters_per_epoch: 10000
+  accum_grad_iters: 1
+  batch_size_train: 8 #prev - 36 * 4 = 144. New: 96 * 2 = 192.
+  batch_size_eval: 32
+  num_workers: 12
+
+  device: "cuda"
+  use_distributed: True
+  amp: True
+  world_size: 4
+  dist_url: "env://"
+  custom_metrics: False
+  decode_ratio: 0.1
+
+  optims:
+    max_epoch: 50
+    warmup_steps: 5000
+    warmup_start_lr: 0
+    init_lr: 9e-5
+    min_lr: 1e-5
+    weight_decay: 0.05
+    beta2: 0.999
+    max_grad_norm: 2
+    max_grad_value: 1.0
+    resume_epoch: True
+    resume_optimizer: True
+
+  augmentations:
+    bandmask: 0.1  # drop at most this fraction of freqs in mel scale, ratio
+    revecho: 0.1  # add reverb like augment, ratio
+    timescale: 0.9  # random time scaling, float between 0-4
+    flip: 0.1 # random flip, ratio
+
+    noise_dirs:
+      - "/path/to/audio_16k/noise/demand_10s"
+      - "/path/to/audio_16k/noise/idmt"
+      - "/path/to/audio_16k/noise/tut2016_10s"
+      - "/path/to/audio_16k/noise/urbansound"
+      - "/path/to/audio_16k/noise/freesound_10s"
+      - "/path/to/audio_16k/noise/orcasound_shipnoise_10s"
+      - "/path/to/audio_16k/noise/deepship_10s"
+      - "/path/to/audio_16k/noise/shipsear_10s"
+      - "/path/to/audio_16k/noise/wham_noise"
+      - "/path/to/audio_16k/noise/audioset"
+      - "/path/to/audio_16k/noise/ssw-detection"
+    noise_prob: 0.4
+    time_scale_prob: 0.00
+    mask_audio_prob: 0.10
+    time_scale: 1.1
+    low_snr: -10
+    high_snr: 25
+    use_augmentation: True
+    mixup_prob: 0.45
+    mixup_count: 2
+
+generate:
+  max_new_tokens: 60
+  num_beams: 4
+  do_sample: False
+  min_length: 1
+  temperature: 0.1
+  repetition_penalty: 1.0
+  length_penalty: 1.0

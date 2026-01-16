@@ -1,0 +1,10 @@
+{
+  "species": "comgra",
+  "product": "abundance",
+  "resolution": "27km",
+  "bands": 52,
+  "dtype": "uint8",
+  "scale": 0.0039,
+  "offset": 0,
+  "source": "comgra_abundance_median_27km_2023.tif"
+}
