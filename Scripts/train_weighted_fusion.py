@@ -253,7 +253,9 @@ class NatureLMAudioEncoder(nn.Module):
 
 
 class PriorGatingNetwork(nn.Module):
-    """Gating network to learn w(a,x,t) based on audio and prior features."""
+    """
+    Gating network to learn w(a,x,t) based on audio and prior features.
+    """
     
     def __init__(self, input_dim: int, hidden_dim: int = 64, w_max: float = 2.0):
         super().__init__()
@@ -350,7 +352,7 @@ class WeightedFusionModel(nn.Module):
         self.audio_classifier = nn.Linear(audio_encoder.encoder_dim, num_classes)
         
         # Learnable parameters
-        self.temperature = nn.Parameter(torch.ones(1))  # Temperature scaling
+        self.temperature = nn.Parameter(torch.ones(1))   # Temperature scaling
         self.epsilon = nn.Parameter(torch.tensor(0.01))  # Prior smoothing (clamped to [1e-8, 0.5])
         
         if use_gating:
