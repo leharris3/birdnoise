@@ -17,6 +17,7 @@ from datetime import datetime
 import json
 import math
 
+import librosa
 import numpy as np
 import pandas as pd
 import torch
@@ -80,6 +81,7 @@ class CBIBirdDataset(Dataset):
         sample_rate: int = 16000,
     ):
         self.audio_dir = Path(audio_dir)
+        
         # Keep original index for cache lookup
         self.metadata_df = metadata_df.copy()
         self.original_indices = self.metadata_df.index.values
@@ -93,12 +95,20 @@ class CBIBirdDataset(Dataset):
         return len(self.metadata_df)
     
     def __getitem__(self, idx):
+
         row = self.metadata_df.iloc[idx]
         
         # Load audio
         species_code = row["ebird_code"]
         filename = row["filename"]
+
+        import glob
+
+        # match the first '.ogg' or '.mp3' in audio_files
         audio_path = self.audio_dir / species_code / filename
+
+        # HACK: .mp3 -> .ogg
+        audio_path = audio_path.__str__().replace(".mp3", ".ogg") 
         
         try:
             # Suppress MP3 decoder notes (these come from mpg123 C library via soundfile)
@@ -133,7 +143,11 @@ class CBIBirdDataset(Dataset):
             finally:
                 sys.stderr = old_stderr
         except Exception:
-            audio = np.zeros(self.max_samples, dtype=np.float32)
+
+            # HACK
+            # audio = np.zeros(self.max_samples, dtype=np.float32)
+            # raise Exception(f"failed to load audio: {audio_path}")
+            print(f"Error: failed to load:  {audio_path}")
             sr = self.sample_rate
         
         # Convert to mono if stereo
@@ -214,6 +228,7 @@ class NatureLMAudioEncoder(nn.Module):
         # Freeze encoder
         for param in self.naturelm.parameters():
             param.requires_grad = False
+            
         self.naturelm.eval()
         
         # Determine encoder dimension
@@ -224,6 +239,7 @@ class NatureLMAudioEncoder(nn.Module):
         
         print(f"Encoder dimension: {self.encoder_dim}")
     
+    # NOTE: we don't EVER finetune the audio encoder
     @torch.no_grad()
     def encode(self, audio: torch.Tensor) -> torch.Tensor:
         """Extract features from audio."""
@@ -349,6 +365,7 @@ class WeightedFusionModel(nn.Module):
         self.use_gating = use_gating
         
         # Audio classifier
+        # p( y | x)
         self.audio_classifier = nn.Linear(audio_encoder.encoder_dim, num_classes)
         
         # Learnable parameters
@@ -609,13 +626,18 @@ class EBirdPriorWrapper:
                             if species in species_to_idx:
                                 prior_probs[i, j] = cached_prior[species_to_idx[species]]
                 else:
+                    
+                    # raise Exception(f"Error: failed to find prior probability for i, sample_idx: {i, sample_idx}")
+                    print(f"Warning: failed to find prior probability for i, sample_idx: {i, sample_idx}")
+                    
                     # Fallback to small uniform value if index not found
-                    prior_probs[i] = np.ones(num_species) * 1e-6
+                    # prior_probs[i] = np.ones(num_species) * 1e-6
             
             return prior_probs
         
         # Fallback to on-the-fly computation
         # Uniform prior as default
+        print("Warning: assuming uniform prior.")
         uniform_prob = 1.0 / num_species
         prior_probs = np.ones((batch_size, num_species)) * uniform_prob
         
@@ -628,6 +650,7 @@ class EBirdPriorWrapper:
                 season = week_to_season(week)
                 season_indices.append(season)
             except:
+                print(f"Warning: failed to convert date_str: {date_str}.")
                 season_indices.append(1)  # Default to Spring
         
         # Convert to arrays
@@ -644,10 +667,12 @@ class EBirdPriorWrapper:
                     lon_arr[i] = lon_f
                     valid_mask[i] = True
             except:
+                print(f"Warning: error for i, lat, lon: {i, lat, lon}")
                 pass
         
         # Skip if no valid coordinates
         if not valid_mask.any():
+            print("returning uniform dist of prior probs")
             return prior_probs
         
         # Group by season for batch lookups (only 4 seasons instead of 52 weeks!)
@@ -684,6 +709,7 @@ class EBirdPriorWrapper:
                         if local_i < len(probs) and probs[local_i] > 0:
                             prior_probs[global_i, j] = probs[local_i]
                 except Exception:
+                    raise Exception("Error parsing unique seasons.")
                     # Silently skip errors
                     pass
         
@@ -713,6 +739,7 @@ def train_epoch(
 ):
     """Train for one epoch."""
     model.train()
+
     if stage == "A" or stage == "B":
         # Freeze audio encoder
         model.audio_encoder.eval()
@@ -758,6 +785,7 @@ def train_epoch(
             # Use uniform prior during training for speed
             batch_size = len(metadata)
             num_classes = model.num_classes
+            print(f"Using uniform prior distribution.")
             prior_probs = torch.ones(batch_size, num_classes, device=device) / num_classes
         
         optimizer.zero_grad()
@@ -769,6 +797,7 @@ def train_epoch(
             )
             loss = F.cross_entropy(final_logits, labels)
             
+            # TODO: this looks sketch
             # Regularization on weight
             if model.use_gating:
                 # L2 regularization on gate outputs (computed in forward)
@@ -911,7 +940,7 @@ def evaluate(
         try:
             return roc_auc_score(y_true, y_score)
         except:
-            return 0.5
+            return Exception(f"Failed to compute R-AUC")
     
     def compute_nmi(features: np.ndarray, labels: np.ndarray) -> float:
         """Compute Normalized Mutual Information using k-means clustering."""
@@ -956,7 +985,6 @@ def evaluate(
         fp = cm.sum(axis=0) - tp
         fn = cm.sum(axis=1) - tp
         tn = cm.sum() - (tp + fp + fn)
-        
         # Aggregate across all classes
         return {
             "tp": tp.sum(),
@@ -1239,7 +1267,25 @@ def main():
     # Load data
     data_dir = Path(args.data_dir).resolve()
     train_csv = pd.read_csv(data_dir / "train.csv")
+
+    found = []
     
+    # iterate through train_csv and
+    # remove any samples w/o valid audio paths
+    for row in train_csv.iterrows():
+
+        species_code = row[1]["ebird_code"]
+        filename     = row[1]["filename"]
+        # match the first '.ogg' or '.mp3' in audio_files
+        audio_path = Path("/work/11295/leharris3/birdnoise/Data/cbi/train_audio") / species_code / filename
+        # HACK: .mp3 -> .ogg
+        audio_path = Path(audio_path.__str__().replace(".mp3", ".ogg"))
+        found.append(audio_path.is_file())
+    
+    train_csv['found'] = found
+    train_csv = train_csv[train_csv["found"] == True]
+    print(f"HACK: remove missing .ogg files; # remaining: {len(train_csv)}")
+
     # Filter out BEANS test files (if using BEANS benchmark)
     # For now, use all CBI data
     print(f"Total CBI samples: {len(train_csv)}")
@@ -1343,6 +1389,7 @@ def main():
     total_steps = len(train_loader) * args.epochs
     warmup_steps = int(total_steps * args.warmup_ratio)
     
+    # TODO
     def lr_lambda(step):
         if step < warmup_steps:
             return step / warmup_steps
@@ -1485,7 +1532,7 @@ def main():
                 "optimizer_state_dict": optimizer.state_dict(),
                 "val_acc": best_val_acc,
             }, save_dir / "best_model.pth")
-            print(f"  New best model saved! (acc: {100*best_val_acc:.2f}%)")
+            print(f"New best model saved! (acc: {100*best_val_acc:.2f}%)")
         
         # Save periodic checkpoint
         if epoch % 5 == 0:
@@ -1501,4 +1548,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
