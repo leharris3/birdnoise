@@ -8,14 +8,14 @@ where:
 - T is learnable temperature
 """
 
-import argparse
-import warnings
-import sys
 import os
-from pathlib import Path
-from datetime import datetime
+import sys
 import json
 import math
+import argparse
+import warnings
+from pathlib import Path
+from datetime import datetime
 
 import librosa
 import numpy as np
@@ -23,11 +23,12 @@ import pandas as pd
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.data import Dataset, DataLoader
-from torch.amp import GradScaler, autocast
-from tqdm import tqdm
 import soundfile as sf
 import resampy
+
+from tqdm import tqdm
+from torch.utils.data import Dataset, DataLoader
+from torch.amp import GradScaler, autocast
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import accuracy_score, top_k_accuracy_score, confusion_matrix, roc_auc_score, normalized_mutual_info_score
 from sklearn.cluster import KMeans
@@ -91,18 +92,22 @@ class CBIBirdDataset(Dataset):
         self.sample_rate = sample_rate
         self.max_samples = int(max_length_seconds * sample_rate)
         
+        # cache samples
+        self.buffer = {}
+        
     def __len__(self):
         return len(self.metadata_df)
     
     def __getitem__(self, idx):
 
+        if idx in self.buffer:
+            return self.buffer[idx]
+        
         row = self.metadata_df.iloc[idx]
         
         # Load audio
         species_code = row["ebird_code"]
         filename = row["filename"]
-
-        import glob
 
         # match the first '.ogg' or '.mp3' in audio_files
         audio_path = self.audio_dir / species_code / filename
@@ -143,11 +148,8 @@ class CBIBirdDataset(Dataset):
             finally:
                 sys.stderr = old_stderr
         except Exception:
-
-            # HACK
             # audio = np.zeros(self.max_samples, dtype=np.float32)
-            # raise Exception(f"failed to load audio: {audio_path}")
-            print(f"Error: failed to load:  {audio_path}")
+            raise Exception(f"Error: failed to load:  {audio_path}")
             sr = self.sample_rate
         
         # Convert to mono if stereo
@@ -201,12 +203,17 @@ class CBIBirdDataset(Dataset):
         # Get original index for cache lookup
         original_idx = self.original_indices[idx]
         
-        return {
+        sample = {
             "audio": torch.from_numpy(audio.astype(np.float32)),
             "label": label,
             "metadata": metadata,
             "sample_idx": original_idx,  # For cache lookup
         }
+        
+        # add to cache
+        self.buffer[idx] = sample
+        
+        return sample
 
 
 # ============================================================================
@@ -261,6 +268,93 @@ class NatureLMAudioEncoder(nn.Module):
             features = audio_embeds[:, 0, :]
         
         return features
+    
+    def forward(self, audio: torch.Tensor) -> tuple:
+        """Forward pass returning logits and features."""
+        features = self.encode(audio)
+        return features
+
+    
+    # NUM_AUDIO_QUERY_TOKENS = 1
+    
+    # def __init__(self, use_qformer: bool = True, pooling: str = "mean", cache_dir="../__cache__"):
+        
+    #     super().__init__()
+    #     self.use_qformer = use_qformer
+    #     self.pooling     = pooling
+        
+    #     # load entire model if cached encoder DNE
+    #     beats_ckpt   = Path(cache_dir) / Path("beats.pth")
+    #     ln_audio     = Path(cache_dir) / Path("ln_audio.pth")
+    #     qformer_ckpt = Path(cache_dir) / Path("qformer.pth")
+    #     aqt_ckpt     = Path(cache_dir) / Path("audio_query_tokens.pth")
+    #     alp_ckpt     = Path(cache_dir) / Path("audio_llama_project.pth")
+        
+    #     if not beats_ckpt.is_file() or not qformer_ckpt.is_file() or not ln_audio.is_file() or not aqt_ckpt.is_file() or not alp_ckpt.is_file():
+            
+    #         from NatureLM.models import NatureLM
+            
+    #         print("Loading + caching NatureLM-audio encoder...")
+    #         full_model = NatureLM.from_pretrained("EarthSpeciesProject/NatureLM-audio")
+    #         torch.save(full_model.beats, str(beats_ckpt))
+    #         torch.save(full_model.audio_Qformer, str(qformer_ckpt))
+    #         torch.save(full_model.ln_audio, str(ln_audio))
+    #         torch.save(full_model.audio_query_tokens, str(aqt_ckpt))
+    #         torch.save(full_model.audio_llama_proj, str(alp_ckpt))
+                    
+    #     self.beats                 = torch.load(str(beats_ckpt), weights_only=False)
+    #     self.ln_audio              = torch.load(str(ln_audio), weights_only=False)
+    #     self.audio_Qformer         = torch.load(str(qformer_ckpt), weights_only=False)
+    #     self.audio_query_tokens    = torch.load(str(aqt_ckpt), weights_only=False)
+    #     self.audio_llama_proj      = torch.load(str(alp_ckpt), weights_only=False)
+    #     self.num_audio_query_token = NatureLMAudioEncoder.NUM_AUDIO_QUERY_TOKENS
+        
+    #     if self.audio_Qformer != None: self.use_qformer = True
+        
+    #     # freeze
+    #     for param in self.parameters():
+    #         param.requires_grad = False
+            
+    #     self.eval()
+    #     self.encoder_dim = 4096 if self.use_qformer else 527
+    #     print(f"Loaded! Encoder dim: {self.encoder_dim}")
+    
+    # @torch.no_grad()
+    # def encode(self, audio: torch.Tensor) -> torch.Tensor:
+    #     """Extract features from audio."""
+        
+    #     # self.naturelm.eval()
+    #     # # Ensure audio is on the same device as model
+    #     # if audio.device != next(self.naturelm.parameters()).device:
+    #     #     audio = audio.to(next(self.naturelm.parameters()).device)
+        
+    #     # with torch.cuda.amp.autocast(dtype=torch.bfloat16):
+    #     #     audio_embeds, audio_atts = self.naturelm.encode_audio(audio)
+        
+    #     audio_embeds, _ = self.beats(audio, padding_mask=None)
+    #     audio_embeds = self.ln_audio(audio_embeds)
+    #     audio_atts   = torch.ones(audio_embeds.size()[:-1], device=audio.device)
+        
+    #     if self.use_qformer:
+    #         query_tokens = self.audio_query_tokens.expand(audio_embeds.shape[0], -1, -1)
+    #         query_output = self.audio_Qformer.bert(
+    #             query_embeds=query_tokens,
+    #             encoder_hidden_states=audio_embeds,
+    #             encoder_attention_mask=audio_atts,
+    #             return_dict=True,
+    #         )
+    #         audio_embeds = self.audio_llama_proj(query_output.last_hidden_state)
+    #         # audio_atts = torch.ones(audio_embeds.size()[:-1], device=audio.device)
+        
+    #     # pool over sequence dimension
+    #     if self.pooling == "mean":
+    #         audio_embeds = audio_embeds.mean(dim=1)
+    #     elif self.pooling == "max":
+    #         audio_embeds = audio_embeds.max(dim=1)[0]
+    #     else:  # "cls" - take first token
+    #         audio_embeds = audio_embeds[:, 0, :]
+            
+    #     return audio_embeds
     
     def forward(self, audio: torch.Tensor) -> tuple:
         """Forward pass returning logits and features."""
@@ -359,6 +453,7 @@ class WeightedFusionModel(nn.Module):
         w_max: float = 2.0,
         gate_hidden_dim: int = 64,
     ):
+        
         super().__init__()
         self.audio_encoder = audio_encoder
         self.num_classes = num_classes
@@ -369,18 +464,21 @@ class WeightedFusionModel(nn.Module):
         self.audio_classifier = nn.Linear(audio_encoder.encoder_dim, num_classes)
         
         # Learnable parameters
-        self.temperature = nn.Parameter(torch.ones(1))   # Temperature scaling
-        self.epsilon = nn.Parameter(torch.tensor(0.01))  # Prior smoothing (clamped to [1e-8, 0.5])
+        self.temperature = nn.Parameter(torch.ones(1))       # Temperature scaling
+        self.epsilon     = nn.Parameter(torch.tensor(0.01))  # Prior smoothing (clamped to [1e-8, 0.5])
         
         if use_gating:
+            
             # Gating network
             self.gate_network = PriorGatingNetwork(
                 input_dim=12,  # 3 audio + 3 prior + 6 metadata
                 hidden_dim=gate_hidden_dim,
                 w_max=w_max,
             )
-            self.w_weight = None  # Not used when gating
+            self.w_weight = None
+            # self.w_weight = nn.Parameter(torch.tensor(0.5))  # Initial weight  # Not used when gating
         else:
+            
             # Scalar weight
             self.w_weight = nn.Parameter(torch.tensor(0.5))  # Initial weight
             self.gate_network = None
@@ -436,7 +534,7 @@ class WeightedFusionModel(nn.Module):
         prior_robust = prior_probs + eps  # Just add small constant to avoid log(0)
         
         # Log prior (model will learn scale via w and temperature)
-        log_prior = torch.log(prior_robust + 1e-10)
+        log_prior = torch.log(prior_robust)
         
         # Compute weight w(a,x,t)
         if self.use_gating and metadata is not None:
@@ -738,11 +836,16 @@ def train_epoch(
     use_prior_in_training: bool = False,
 ):
     """Train for one epoch."""
+    
     model.train()
 
     if stage == "A" or stage == "B":
-        # Freeze audio encoder
+        
+        # freeze audio encoder
         model.audio_encoder.eval()
+        print(f"Total model params: # {sum(p.numel() for p in model.parameters())}")
+        print(f"Trainable   params: # {sum(p.numel() for p in model.parameters() if p.requires_grad)}")
+        
         for param in model.audio_encoder.parameters():
             param.requires_grad = False
     
@@ -757,18 +860,18 @@ def train_epoch(
     
     for batch_idx, batch in enumerate(pbar):
         batch_start = time.time()
-        audio = batch["audio"].to(device, non_blocking=True)
-        labels = batch["label"].to(device, non_blocking=True)
-        metadata = batch["metadata"]
+        audio       = batch["audio"].to(device, non_blocking=True)
+        labels      = batch["label"].to(device, non_blocking=True)
+        metadata    = batch["metadata"]
         
-        # Get prior probabilities
+        # get prior probabilities
         if use_prior_in_training:
-            latitudes = [m["latitude"] for m in metadata]
-            longitudes = [m["longitude"] for m in metadata]
-            dates = [m["date"] for m in metadata]
+            latitudes      = [m["latitude"] for m in metadata]
+            longitudes     = [m["longitude"] for m in metadata]
+            dates          = [m["date"] for m in metadata]
             sample_indices = batch.get("sample_indices", None)
             
-            # Show progress for first batch (only if not using cache)
+            # show progress for first batch (only if not using cache)
             if total == 0 and not prior_model.use_cache:
                 print(f"\nComputing prior for first batch (this may take a minute to load cache)...")
                 pbar.refresh()
@@ -782,7 +885,8 @@ def train_epoch(
                 print("Prior computed, starting training...")
                 pbar.refresh()
         else:
-            # Use uniform prior during training for speed
+            
+            # use uniform prior during training for speed
             batch_size = len(metadata)
             num_classes = model.num_classes
             print(f"Using uniform prior distribution.")
@@ -869,9 +973,9 @@ def evaluate(
         metadata = batch["metadata"]
         
         # Get prior
-        latitudes = [m["latitude"] for m in metadata]
+        latitudes  = [m["latitude"] for m in metadata]
         longitudes = [m["longitude"] for m in metadata]
-        dates = [m["date"] for m in metadata]
+        dates      = [m["date"] for m in metadata]
         sample_indices = batch.get("sample_indices", None)
         prior_probs = prior_model.get_prior_probs_batch(
             latitudes, longitudes, dates, sample_indices=sample_indices
@@ -916,9 +1020,14 @@ def evaluate(
     # Average loss
     avg_loss = total_loss / len(labels)
     
-    # Compute BEANS benchmark metrics (Probe, R-AUC, NMI)
+    # compute BEANS benchmark metrics (Probe, R-AUC, NMI)
     def compute_probe_accuracy(logits: np.ndarray, labels: np.ndarray) -> float:
-        """Probe accuracy = top-1 accuracy from logits."""
+        """
+        Probe accuracy = top-1 accuracy from logits.
+        
+        We just train a linear classifer on top of an audio encoder...
+        so a standard acc. metric is a probe metric for us.
+        """
         preds = logits.argmax(axis=1)
         return accuracy_score(labels, preds)
     
@@ -940,7 +1049,7 @@ def evaluate(
         try:
             return roc_auc_score(y_true, y_score)
         except:
-            return Exception(f"Failed to compute R-AUC")
+            raise Exception(f"Failed to compute R-AUC")
     
     def compute_nmi(features: np.ndarray, labels: np.ndarray) -> float:
         """Compute Normalized Mutual Information using k-means clustering."""
@@ -1254,38 +1363,50 @@ def collate_fn(batch):
 
 
 def main():
+    
     args = parse_args()
     
-    # Set seed
+    # set seed
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
     
-    # Device
-    device = args.device if torch.cuda.is_available() else "cpu"
+    # device
+    if args.device:
+        device = args.device
+    elif torch.cuda.is_available():
+        device = "cuda"
+    elif torch.backends.mps.is_available():
+        device = "mps"
+    else:
+        device = "cpu"
+        
     print(f"Using device: {device}")
     
-    # Load data
+    # load data
     data_dir = Path(args.data_dir).resolve()
     train_csv = pd.read_csv(data_dir / "train.csv")
+    
+    # -----------------------------------
 
     found = []
     
     # iterate through train_csv and
     # remove any samples w/o valid audio paths
-    for row in train_csv.iterrows():
+    for row in tqdm(train_csv.iterrows(), total=len(train_csv), desc="Removing missing samples"):
 
         species_code = row[1]["ebird_code"]
         filename     = row[1]["filename"]
         # match the first '.ogg' or '.mp3' in audio_files
-        audio_path = Path("/work/11295/leharris3/birdnoise/Data/cbi/train_audio") / species_code / filename
+        audio_path = Path("../Data/cbi/train_audio") / species_code / filename
         # HACK: .mp3 -> .ogg
         audio_path = Path(audio_path.__str__().replace(".mp3", ".ogg"))
         found.append(audio_path.is_file())
-    
+        
     train_csv['found'] = found
     train_csv = train_csv[train_csv["found"] == True]
-    print(f"HACK: remove missing .ogg files; # remaining: {len(train_csv)}")
-
+    print(f"HACK: removed missing .ogg files; # remaining: {len(train_csv)}")
+    
+    # -----------------------------------
     # Filter out BEANS test files (if using BEANS benchmark)
     # For now, use all CBI data
     print(f"Total CBI samples: {len(train_csv)}")
@@ -1313,7 +1434,7 @@ def main():
     
     # Initialize model
     print("Loading NatureLM encoder (this may take a minute)...")
-    audio_encoder = NatureLMAudioEncoder(use_qformer=args.use_qformer, pooling=args.pooling)
+    audio_encoder = NatureLMAudioEncoder(use_qformer=True, pooling=args.pooling)
     model = WeightedFusionModel(
         audio_encoder=audio_encoder,
         num_classes=num_classes,
@@ -1341,6 +1462,7 @@ def main():
     
     # Optimizer (only train fusion parameters in stage A/B)
     if args.stage in ["A", "B"]:
+        
         # Freeze audio encoder
         for param in model.audio_encoder.parameters():
             param.requires_grad = False
@@ -1375,7 +1497,7 @@ def main():
     best_val_acc = 0.0
     
     if args.resume:
-        checkpoint = torch.load(args.resume, map_location=device)
+        checkpoint = torch.load(args.resume, map_location=device, weights_only=False)
         model.load_state_dict(checkpoint["model_state_dict"])
         if "optimizer_state_dict" in checkpoint:
             optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
@@ -1412,7 +1534,7 @@ def main():
     torch.save({"label_to_idx": label_to_idx, "idx_to_label": idx_to_label}, 
                save_dir / "label_mapping.pth")
     
-    # Dry run check
+    # dry run check
     if args.dry_run:
         print("\n" + "="*60)
         print("DRY RUN - Testing one batch...")
@@ -1443,6 +1565,7 @@ def main():
         print("Dry run successful!")
         return
     
+    # main training loop
     for epoch in range(start_epoch, args.epochs + 1):
         print(f"\n{'='*60}")
         print(f"Epoch {epoch}/{args.epochs} (Stage {args.stage})")
