@@ -4,9 +4,12 @@
 __logs__
 __cache__
 
+.vscode
 .venv
 .cache
 .claude
+uv.lock
+.python-version
 
 beans
 Figures
