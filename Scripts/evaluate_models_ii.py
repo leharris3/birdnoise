@@ -2,9 +2,16 @@
 Evaluate and compare models: NatureLM likelihood, Prior, Posterior Stage A, Posterior Stage B.
 
 Creates:
-1. Comparison table of Probe, R-AUC, NMI
+1. Comparison table of Probe, R-AUC, NMI, mAP, cmAP
 2. Confusion matrices (TP, FP, FN, TN) for each model
 3. Examples where likelihood is wrong but posterior is correct (saved by prior)
+
+Metrics:
+- Probe: Top-1 accuracy
+- R-AUC: Retrieval ROC-AUC using cosine similarity
+- NMI: Normalized Mutual Information via k-means clustering
+- mAP: Mean Average Precision (one-vs-rest, averaged over classes with samples)
+- cmAP: Class mean Average Precision (macro-averaged, equal weight per class)
 """
 
 import argparse
@@ -23,8 +30,8 @@ from torch.amp import autocast
 from tqdm import tqdm
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import (
-    accuracy_score, confusion_matrix, roc_auc_score, 
-    normalized_mutual_info_score
+    accuracy_score, confusion_matrix, roc_auc_score,
+    normalized_mutual_info_score, average_precision_score
 )
 from sklearn.cluster import KMeans
 
@@ -51,7 +58,7 @@ except ImportError as e:
 
 # Import from train_weighted_fusion
 from train_weighted_fusion import (
-    CBIBirdDataset, collate_fn, NatureLMAudioEncoder, 
+    CBIBirdDataset, collate_fn, NatureLMAudioEncoder,
     WeightedFusionModel, EBirdPriorWrapper
 )
 
@@ -60,6 +67,95 @@ def compute_probe_accuracy(logits: np.ndarray, labels: np.ndarray) -> float:
     """Probe accuracy = top-1 accuracy from logits."""
     preds = logits.argmax(axis=1)
     return accuracy_score(labels, preds)
+
+
+def compute_map(logits: np.ndarray, labels: np.ndarray, num_classes: int) -> float:
+    """
+    Compute mean Average Precision (mAP) for multi-class classification.
+
+    For each class, compute the Average Precision treating it as a binary
+    classification problem (one-vs-rest), then average across all classes
+    that have at least one positive sample.
+
+    Args:
+        logits: Model output logits of shape (N, C)
+        labels: Ground truth labels of shape (N,)
+        num_classes: Total number of classes
+
+    Returns:
+        Mean Average Precision across all classes with positive samples
+    """
+    # Convert logits to probabilities
+    probs = torch.softmax(torch.from_numpy(logits), dim=1).numpy()
+
+    # One-hot encode labels
+    labels_onehot = np.zeros((len(labels), num_classes), dtype=np.float32)
+    labels_onehot[np.arange(len(labels)), labels] = 1.0
+
+    # Compute AP for each class
+    aps = []
+    for c in range(num_classes):
+        # Skip classes with no positive samples
+        if labels_onehot[:, c].sum() == 0:
+            continue
+        try:
+            ap = average_precision_score(labels_onehot[:, c], probs[:, c])
+            aps.append(ap)
+        except ValueError:
+            # Handle edge cases where AP cannot be computed
+            continue
+
+    if len(aps) == 0:
+        return 0.0
+
+    return np.mean(aps)
+
+
+def compute_cmap(logits: np.ndarray, labels: np.ndarray, num_classes: int) -> tuple[float, dict]:
+    """
+    Compute class mean Average Precision (cmAP) for multi-class classification.
+
+    Unlike standard mAP which may weight by class frequency, cmAP gives equal
+    weight to each class (macro-average). This is particularly useful for
+    imbalanced datasets where rare species should count equally.
+
+    Args:
+        logits: Model output logits of shape (N, C)
+        labels: Ground truth labels of shape (N,)
+        num_classes: Total number of classes
+
+    Returns:
+        Tuple of:
+            - cmAP: Class mean Average Precision (macro-averaged)
+            - per_class_ap: Dictionary mapping class index to its AP score
+    """
+    # Convert logits to probabilities
+    probs = torch.softmax(torch.from_numpy(logits), dim=1).numpy()
+
+    # One-hot encode labels
+    labels_onehot = np.zeros((len(labels), num_classes), dtype=np.float32)
+    labels_onehot[np.arange(len(labels)), labels] = 1.0
+
+    # Compute AP for each class
+    per_class_ap = {}
+    for c in range(num_classes):
+        # Skip classes with no positive samples in evaluation set
+        if labels_onehot[:, c].sum() == 0:
+            continue
+        try:
+            ap = average_precision_score(labels_onehot[:, c], probs[:, c])
+            per_class_ap[c] = ap
+        except ValueError:
+            # Handle edge cases where AP cannot be computed
+            continue
+
+    if len(per_class_ap) == 0:
+        return 0.0, {}
+
+    # cmAP is the unweighted mean across all classes (macro-average)
+    cmap = np.mean(list(per_class_ap.values()))
+
+    return cmap, per_class_ap
 
 
 def compute_retrieval_auc(features: np.ndarray, labels: np.ndarray) -> float:
@@ -108,10 +204,10 @@ def compute_confusion_metrics(y_true, y_pred, num_classes):
 
 
 @torch.no_grad()
-def evaluate_model(model, dataloader, device, prior_model, idx_to_label):
+def evaluate_model(model, dataloader, device, prior_model, idx_to_label, num_classes):
     """Evaluate a single model and return metrics and predictions."""
     model.eval()
-    
+
     all_final_logits = []
     all_audio_logits = []
     all_prior_probs = []
@@ -119,12 +215,12 @@ def evaluate_model(model, dataloader, device, prior_model, idx_to_label):
     all_labels = []
     all_metadata = []
     all_weights = []  # For gating weights
-    
+
     for batch in tqdm(dataloader, desc="Evaluating"):
         audio = batch["audio"].to(device)
         labels = batch["label"]
         metadata = batch["metadata"]
-        
+
         # Get prior
         latitudes = [m["latitude"] for m in metadata]
         longitudes = [m["longitude"] for m in metadata]
@@ -134,13 +230,13 @@ def evaluate_model(model, dataloader, device, prior_model, idx_to_label):
             latitudes, longitudes, dates, sample_indices=sample_indices
         )
         prior_probs_tensor = torch.from_numpy(prior_probs).float().to(device)
-        
+
         with autocast("cuda", dtype=torch.bfloat16):
             final_logits, audio_logits, prior_robust = model(
                 audio, prior_probs_tensor, metadata if model.use_gating else None
             )
             features = model.audio_encoder(audio)
-            
+
             # Get gating weights if available
             if model.use_gating and hasattr(model, 'gate_network'):
                 audio_features = model.compute_audio_features(audio_logits)
@@ -151,14 +247,14 @@ def evaluate_model(model, dataloader, device, prior_model, idx_to_label):
                 batch_size = audio.size(0)
                 weights = model.w_weight.expand(batch_size)
                 all_weights.append(weights.cpu().detach())
-        
+
         all_final_logits.append(final_logits.float().cpu().detach())
         all_audio_logits.append(audio_logits.float().cpu().detach())
         all_prior_probs.append(prior_robust.float().cpu().detach())
         all_features.append(features.float().cpu().detach())
         all_labels.append(labels.detach() if isinstance(labels, torch.Tensor) else labels)
         all_metadata.extend(metadata)
-    
+
     final_logits = torch.cat(all_final_logits, dim=0).numpy()
     audio_logits = torch.cat(all_audio_logits, dim=0).numpy()
     prior_probs = torch.cat(all_prior_probs, dim=0).numpy()
@@ -168,33 +264,48 @@ def evaluate_model(model, dataloader, device, prior_model, idx_to_label):
         labels = labels.detach().numpy()
     else:
         labels = np.array(labels)
-    
+
     weights = torch.cat(all_weights, dim=0).numpy() if all_weights else None
-    
+
     # Compute predictions
     final_preds = final_logits.argmax(axis=1)
     audio_preds = audio_logits.argmax(axis=1)
     prior_preds = prior_probs.argmax(axis=1)
-    
-    # num_classes = len(np.unique(labels))
-    num_classes = 184 # HACK 
-    
+
+    # Compute cmAP (class mean Average Precision) for each model output
+    likelihood_cmap, likelihood_per_class_ap = compute_cmap(audio_logits, labels, num_classes)
+    posterior_cmap, posterior_per_class_ap = compute_cmap(final_logits, labels, num_classes)
+    prior_cmap, prior_per_class_ap = compute_cmap(np.log(prior_probs + 1e-10), labels, num_classes)
+
     # Compute metrics
     metrics = {
         "likelihood_probe": compute_probe_accuracy(audio_logits, labels),
         "likelihood_rauc": compute_retrieval_auc(features, labels),
         "likelihood_nmi": compute_nmi(features, labels),
+        "likelihood_map": compute_map(audio_logits, labels, num_classes),
+        "likelihood_cmap": likelihood_cmap,
         "posterior_probe": compute_probe_accuracy(final_logits, labels),
         "posterior_rauc": compute_retrieval_auc(features, labels),
         "posterior_nmi": compute_nmi(features, labels),
+        "posterior_map": compute_map(final_logits, labels, num_classes),
+        "posterior_cmap": posterior_cmap,
         "prior_probe": compute_probe_accuracy(np.log(prior_probs + 1e-10), labels),
+        "prior_map": compute_map(np.log(prior_probs + 1e-10), labels, num_classes),
+        "prior_cmap": prior_cmap,
     }
-    
+
+    # Store per-class AP for detailed analysis
+    per_class_aps = {
+        "likelihood": likelihood_per_class_ap,
+        "posterior": posterior_per_class_ap,
+        "prior": prior_per_class_ap,
+    }
+
     # Confusion matrices
     likelihood_cm = compute_confusion_metrics(labels, audio_preds, num_classes)
     posterior_cm = compute_confusion_metrics(labels, final_preds, num_classes)
     prior_cm = compute_confusion_metrics(labels, prior_preds, num_classes)
-    
+
     metrics.update({
         "likelihood_tp": likelihood_cm["tp"],
         "likelihood_fp": likelihood_cm["fp"],
@@ -209,9 +320,10 @@ def evaluate_model(model, dataloader, device, prior_model, idx_to_label):
         "prior_fn": prior_cm["fn"],
         "prior_tn": prior_cm["tn"],
     })
-    
+
     return {
         "metrics": metrics,
+        "per_class_aps": per_class_aps,
         "audio_logits": audio_logits,
         "prior_probs": prior_probs,
         "final_logits": final_logits,
@@ -222,71 +334,83 @@ def evaluate_model(model, dataloader, device, prior_model, idx_to_label):
 
 
 def plot_comparison_table(metrics_dict, output_path):
-    """Create comparison table of Probe, R-AUC, NMI."""
+    """Create comparison table of Probe, R-AUC, NMI, mAP, cmAP."""
     if not HAS_MATPLOTLIB:
         print("matplotlib not available, skipping table plot")
         return
-    
+
     models = []
     probe_values = []
     rauc_values = []
     nmi_values = []
-    
+    map_values = []
+    cmap_values = []
+
     # NatureLM (likelihood)
     if "likelihood" in metrics_dict:
         models.append("NatureLM\n(Likelihood)")
         probe_values.append(metrics_dict["likelihood"]["metrics"]["likelihood_probe"])
         rauc_values.append(metrics_dict["likelihood"]["metrics"]["likelihood_rauc"])
         nmi_values.append(metrics_dict["likelihood"]["metrics"]["likelihood_nmi"])
-    
+        map_values.append(metrics_dict["likelihood"]["metrics"]["likelihood_map"])
+        cmap_values.append(metrics_dict["likelihood"]["metrics"]["likelihood_cmap"])
+
     # Prior
     if "prior" in metrics_dict:
         models.append("Prior Model")
         probe_values.append(metrics_dict["prior"]["metrics"]["prior_probe"])
         rauc_values.append(np.nan)  # R-AUC not applicable to prior
         nmi_values.append(np.nan)  # NMI not applicable to prior
-    
+        map_values.append(metrics_dict["prior"]["metrics"]["prior_map"])
+        cmap_values.append(metrics_dict["prior"]["metrics"]["prior_cmap"])
+
     # Posterior Stage A
     if "stage_a" in metrics_dict:
         models.append("Posterior\nStage A")
         probe_values.append(metrics_dict["stage_a"]["metrics"]["posterior_probe"])
         rauc_values.append(metrics_dict["stage_a"]["metrics"]["posterior_rauc"])
         nmi_values.append(metrics_dict["stage_a"]["metrics"]["posterior_nmi"])
-    
+        map_values.append(metrics_dict["stage_a"]["metrics"]["posterior_map"])
+        cmap_values.append(metrics_dict["stage_a"]["metrics"]["posterior_cmap"])
+
     # Posterior Stage B
     if "stage_b" in metrics_dict:
         models.append("Posterior\nStage B")
         probe_values.append(metrics_dict["stage_b"]["metrics"]["posterior_probe"])
         rauc_values.append(metrics_dict["stage_b"]["metrics"]["posterior_rauc"])
         nmi_values.append(metrics_dict["stage_b"]["metrics"]["posterior_nmi"])
-    
-    fig, ax = plt.subplots(figsize=(10, 6))
+        map_values.append(metrics_dict["stage_b"]["metrics"]["posterior_map"])
+        cmap_values.append(metrics_dict["stage_b"]["metrics"]["posterior_cmap"])
+
+    fig, ax = plt.subplots(figsize=(14, 6))
     ax.axis('tight')
     ax.axis('off')
-    
+
     data = []
     for i, model in enumerate(models):
         probe_str = f"{100*probe_values[i]:.2f}%" if not np.isnan(probe_values[i]) else "N/A"
         rauc_str = f"{rauc_values[i]:.4f}" if not np.isnan(rauc_values[i]) else "N/A"
         nmi_str = f"{nmi_values[i]:.4f}" if not np.isnan(nmi_values[i]) else "N/A"
-        data.append([model, probe_str, rauc_str, nmi_str])
-    
+        map_str = f"{map_values[i]:.4f}" if not np.isnan(map_values[i]) else "N/A"
+        cmap_str = f"{cmap_values[i]:.4f}" if not np.isnan(cmap_values[i]) else "N/A"
+        data.append([model, probe_str, rauc_str, nmi_str, map_str, cmap_str])
+
     table = ax.table(cellText=data,
-                     colLabels=["Model", "Probe", "R-AUC", "NMI"],
+                     colLabels=["Model", "Probe", "R-AUC", "NMI", "mAP", "cmAP"],
                      cellLoc='center',
                      loc='center',
                      bbox=[0, 0, 1, 1])
-    
+
     table.auto_set_font_size(False)
     table.set_fontsize(12)
     table.scale(1, 2)
-    
+
     # Style header
-    for i in range(4):
+    for i in range(6):
         table[(0, i)].set_facecolor('#40466e')
         table[(0, i)].set_text_props(weight='bold', color='white')
-    
-    plt.title("Model Comparison: Probe, R-AUC, NMI", fontsize=14, fontweight='bold', pad=20)
+
+    plt.title("Model Comparison: Probe, R-AUC, NMI, mAP, cmAP", fontsize=14, fontweight='bold', pad=20)
     plt.savefig(output_path, dpi=300, bbox_inches='tight')
     plt.close()
     print(f"Saved comparison table to {output_path}")
@@ -297,17 +421,17 @@ def plot_confusion_matrices(metrics_dict, output_path):
     if not HAS_MATPLOTLIB:
         print("matplotlib not available, skipping confusion matrices")
         return
-    
+
     n_models = sum(1 for k in ["likelihood", "prior", "stage_a", "stage_b"] if k in metrics_dict)
     if n_models == 0:
         return
-    
+
     fig, axes = plt.subplots(1, n_models, figsize=(5*n_models, 4))
     if n_models == 1:
         axes = [axes]
-    
+
     idx = 0
-    
+
     # NatureLM
     if "likelihood" in metrics_dict:
         m = metrics_dict["likelihood"]["metrics"]
@@ -330,7 +454,7 @@ def plot_confusion_matrices(metrics_dict, output_path):
             plt.colorbar(im, ax=axes[idx])
         axes[idx].set_title("NatureLM\n(Likelihood)", fontweight='bold')
         idx += 1
-    
+
     # Prior
     if "prior" in metrics_dict:
         m = metrics_dict["prior"]["metrics"]
@@ -353,7 +477,7 @@ def plot_confusion_matrices(metrics_dict, output_path):
             plt.colorbar(im, ax=axes[idx])
         axes[idx].set_title("Prior Model", fontweight='bold')
         idx += 1
-    
+
     # Stage A
     if "stage_a" in metrics_dict:
         m = metrics_dict["stage_a"]["metrics"]
@@ -376,7 +500,7 @@ def plot_confusion_matrices(metrics_dict, output_path):
             plt.colorbar(im, ax=axes[idx])
         axes[idx].set_title("Posterior\nStage A", fontweight='bold')
         idx += 1
-    
+
     # Stage B
     if "stage_b" in metrics_dict:
         m = metrics_dict["stage_b"]["metrics"]
@@ -399,7 +523,7 @@ def plot_confusion_matrices(metrics_dict, output_path):
             plt.colorbar(im, ax=axes[idx])
         axes[idx].set_title("Posterior\nStage B", fontweight='bold')
         idx += 1
-    
+
     plt.tight_layout()
     plt.savefig(output_path, dpi=300, bbox_inches='tight')
     plt.close()
@@ -414,24 +538,24 @@ def plot_pathological_examples(
     if not HAS_MATPLOTLIB:
         print("matplotlib not available, skipping pathological examples")
         return
-    
+
     # Convert to probabilities
     audio_probs = torch.softmax(torch.from_numpy(audio_logits), dim=1).numpy()
     final_probs = torch.softmax(torch.from_numpy(final_logits), dim=1).numpy()
-    
+
     # Find examples where:
     # - Likelihood prediction is wrong
     # - Posterior prediction is correct
     audio_preds = audio_probs.argmax(axis=1)
     final_preds = final_probs.argmax(axis=1)
-    
+
     mask = (audio_preds != labels) & (final_preds == labels)
     candidate_indices = np.where(mask)[0]
-    
+
     if len(candidate_indices) == 0:
         print("No examples found where likelihood is wrong but posterior is correct")
         return
-    
+
     # Sort by weight (highest weight = most prior influence)
     weights_flat = None
     if weights is not None:
@@ -439,53 +563,53 @@ def plot_pathological_examples(
         candidate_weights = weights_flat[candidate_indices]
         sorted_idx = np.argsort(candidate_weights)[::-1]  # Highest first
         candidate_indices = candidate_indices[sorted_idx]
-    
+
     num_examples = min(num_examples, len(candidate_indices))
-    
+
     for i in range(num_examples):
         idx = candidate_indices[i]
-        
+
         true_label = labels[idx]
         audio_pred = audio_preds[idx]
         final_pred = final_preds[idx]
-        
+
         # Get top species
         top_k = 10
         top_indices = np.argsort(final_probs[idx])[-top_k:][::-1]
-        
+
         species_names = [idx_to_label[j] for j in top_indices]
         audio_vals = audio_probs[idx, top_indices]
         prior_vals = prior_probs[idx, top_indices]
         final_vals = final_probs[idx, top_indices]
-        
+
         # Normalize prior for display
         prior_vals_norm = prior_vals / (prior_vals.sum() + 1e-10)
-        
+
         # Create plot
         fig, ax = plt.subplots(figsize=(12, 8))
-        
+
         x = np.arange(len(species_names))
         width = 0.25
-        
-        bars1 = ax.bar(x - width, audio_vals, width, label='Likelihood (NatureLM)', 
+
+        bars1 = ax.bar(x - width, audio_vals, width, label='Likelihood (NatureLM)',
                       color='#3498db', alpha=0.8)
-        bars2 = ax.bar(x, prior_vals_norm, width, label='Prior', 
+        bars2 = ax.bar(x, prior_vals_norm, width, label='Prior',
                       color='#2ecc71', alpha=0.8)
-        bars3 = ax.bar(x + width, final_vals, width, label='Posterior', 
+        bars3 = ax.bar(x + width, final_vals, width, label='Posterior',
                       color='#e74c3c', alpha=0.8)
-        
+
         # Highlight true label and predictions
         true_idx_in_top = np.where(top_indices == true_label)[0]
         audio_pred_idx_in_top = np.where(top_indices == audio_pred)[0]
         final_pred_idx_in_top = np.where(top_indices == final_pred)[0]
-        
+
         if len(true_idx_in_top) > 0:
             ax.axvline(x=true_idx_in_top[0], color='green', linestyle='--', linewidth=2, alpha=0.5, label='True label')
         if len(audio_pred_idx_in_top) > 0:
             ax.axvline(x=audio_pred_idx_in_top[0], color='blue', linestyle=':', linewidth=2, alpha=0.5, label='Likelihood pred')
         if len(final_pred_idx_in_top) > 0:
             ax.axvline(x=final_pred_idx_in_top[0], color='red', linestyle='-.', linewidth=2, alpha=0.5, label='Posterior pred')
-        
+
         ax.set_xlabel('Species', fontsize=12, fontweight='bold')
         ax.set_ylabel('Probability', fontsize=12, fontweight='bold')
         ax.set_title(f'Example {i+1}: Prior "Saves" Likelihood\n'
@@ -497,18 +621,18 @@ def plot_pathological_examples(
         ax.set_xticklabels(species_names, rotation=45, ha='right', fontsize=10)
         ax.legend(loc='upper right', fontsize=10)
         ax.grid(axis='y', alpha=0.3)
-        
+
         # Add metadata
         meta = metadata[idx]
         date_str = meta.get("date", "Unknown")
         lat = meta.get("latitude", "?")
         lon = meta.get("longitude", "?")
         weight_str = f"{weights_flat[idx]:.3f}" if weights_flat is not None else "N/A"
-        
+
         info_text = f"Date: {date_str}\nLocation: ({lat:.2f}, {lon:.2f})\nWeight: {weight_str}"
         ax.text(0.02, 0.98, info_text, transform=ax.transAxes, fontsize=9,
                 verticalalignment='top', bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
-        
+
         plt.tight_layout()
         output_path = output_dir / f"pathological_example_{i+1}.png"
         plt.savefig(output_path, dpi=300, bbox_inches='tight')
@@ -518,7 +642,7 @@ def plot_pathological_examples(
 
 def main():
     parser = argparse.ArgumentParser(description="Evaluate and compare models")
-    parser.add_argument("--data_dir", type=str, default="../Data/cbi")
+    parser.add_argument("--data_dir", type=str, default="../Data/beans/cbi")
     parser.add_argument("--priors_dir", type=str, default="../Data/priors")
     parser.add_argument("--priors_cache", type=str, default=None)
     parser.add_argument("--checkpoint_stage_a", type=str, default=None,
@@ -533,24 +657,24 @@ def main():
     parser.add_argument("--use_qformer", action="store_true")
     parser.add_argument("--pooling", type=str, default="mean", choices=["mean", "max", "cls"])
     parser.add_argument("--seed", type=int, default=42)
-    
+
     args = parser.parse_args()
-    
+
     device = args.device if torch.cuda.is_available() else "cpu"
     print(f"Using device: {device}")
-    
+
     # Create output directory
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
-    
+
     # Load data
     data_dir = Path(args.data_dir).resolve()
     train_csv = pd.read_csv(data_dir / "train.csv")
-    
+
     # -----------------------------------
 
     found = []
-    
+
     # iterate through train_csv and
     # remove any samples w/o valid audio paths
     for row in tqdm(train_csv.iterrows(), total=len(train_csv), desc="Removing missing samples"):
@@ -558,34 +682,34 @@ def main():
         species_code = row[1]["ebird_code"]
         filename     = row[1]["filename"]
         # match the first '.ogg' or '.mp3' in audio_files
-        audio_path = Path("../Data/cbi/train_audio") / species_code / filename
+        audio_path = data_dir / "train_audio" / species_code / filename
         # HACK: .mp3 -> .ogg
         audio_path = Path(audio_path.__str__().replace(".mp3", ".ogg"))
         found.append(audio_path.is_file())
-        
+
     train_csv['found'] = found
     train_csv = train_csv[train_csv["found"] == True]
     print(f"HACK: removed missing .ogg files; # remaining: {len(train_csv)}")
-    
+
     all_species = sorted(train_csv["species"].unique())
     label_to_idx = {s: i for i, s in enumerate(all_species)}
     idx_to_label = {i: s for s, i in label_to_idx.items()}
-    
+
     # num_classes = len(all_species)
     num_classes = 184 # HACK
-    
+
     # Split data (use validation set)
     train_split, val_split = train_test_split(
         train_csv, test_size=0.1, stratify=train_csv["species"], random_state=args.seed
     )
-    
+
     audio_dir = data_dir / "train_audio"
     val_dataset = CBIBirdDataset(audio_dir, val_split, label_to_idx)
     val_loader = DataLoader(
         val_dataset, batch_size=args.batch_size, shuffle=False,
         num_workers=args.num_workers, pin_memory=True, collate_fn=collate_fn
     )
-    
+
     # Load prior model
     print("Loading prior model...")
     cache_path = Path(args.priors_cache).resolve() if args.priors_cache else None
@@ -596,13 +720,13 @@ def main():
         cache_path=cache_path,
         df_index=train_csv.index,
     )
-    
+
     # Load models
     metrics_dict = {}
-    
+
     # We'll extract likelihood metrics from Stage B model (both use same audio encoder)
     # So we don't need a separate likelihood model
-    
+
     # Stage A (scalar weight)
     stage_a_path = args.checkpoint_stage_a
     if stage_a_path is None:
@@ -615,7 +739,7 @@ def main():
             if Path(p).exists():
                 stage_a_path = p
                 break
-    
+
     if stage_a_path and Path(stage_a_path).exists():
         print("\n" + "="*60)
         print("Evaluating Posterior Stage A")
@@ -625,7 +749,7 @@ def main():
             torch.cuda.empty_cache()
             import time
             time.sleep(1)  # Small delay to let CUDA settle
-        
+
         audio_encoder_a = NatureLMAudioEncoder(use_qformer=args.use_qformer, pooling=args.pooling)
         model_a = WeightedFusionModel(
             audio_encoder=audio_encoder_a,
@@ -635,9 +759,9 @@ def main():
         model_a = model_a.to(device)
         checkpoint = torch.load(stage_a_path, map_location=device, weights_only=False)
         model_a.load_state_dict(checkpoint["model_state_dict"])
-        results_a = evaluate_model(model_a, val_loader, device, prior_model, idx_to_label)
+        results_a = evaluate_model(model_a, val_loader, device, prior_model, idx_to_label, num_classes)
         metrics_dict["stage_a"] = results_a
-        
+
         # Clean up Stage A model
         del model_a
         del audio_encoder_a
@@ -645,7 +769,7 @@ def main():
             torch.cuda.empty_cache()
             import time
             time.sleep(1)
-        
+
         # If likelihood not already extracted from Stage B, extract from Stage A
         if "likelihood" not in metrics_dict:
             metrics_dict["likelihood"] = {
@@ -653,6 +777,8 @@ def main():
                     "likelihood_probe": results_a["metrics"]["likelihood_probe"],
                     "likelihood_rauc": results_a["metrics"]["likelihood_rauc"],
                     "likelihood_nmi": results_a["metrics"]["likelihood_nmi"],
+                    "likelihood_map": results_a["metrics"]["likelihood_map"],
+                    "likelihood_cmap": results_a["metrics"]["likelihood_cmap"],
                     "likelihood_tp": results_a["metrics"]["likelihood_tp"],
                     "likelihood_fp": results_a["metrics"]["likelihood_fp"],
                     "likelihood_fn": results_a["metrics"]["likelihood_fn"],
@@ -661,7 +787,7 @@ def main():
             }
     else:
         print(f"Warning: Stage A checkpoint not found")
-    
+
     # Stage B (gating network)
     if Path(args.checkpoint_stage_b).exists():
         print("\n" + "="*60)
@@ -672,7 +798,7 @@ def main():
             torch.cuda.empty_cache()
             import time
             time.sleep(1)  # Small delay to let CUDA settle
-        
+
         audio_encoder_b = NatureLMAudioEncoder(use_qformer=args.use_qformer, pooling=args.pooling)
         model_b = WeightedFusionModel(
             audio_encoder=audio_encoder_b,
@@ -682,9 +808,9 @@ def main():
         model_b = model_b.to(device)
         checkpoint = torch.load(args.checkpoint_stage_b, map_location=device, weights_only=False)
         model_b.load_state_dict(checkpoint["model_state_dict"])
-        results_b = evaluate_model(model_b, val_loader, device, prior_model, idx_to_label)
+        results_b = evaluate_model(model_b, val_loader, device, prior_model, idx_to_label, num_classes)
         metrics_dict["stage_b"] = results_b
-        
+
         # Clean up Stage B model (but keep results for pathological examples)
         # We'll delete after we extract what we need
         del model_b
@@ -693,13 +819,15 @@ def main():
             torch.cuda.empty_cache()
             import time
             time.sleep(1)
-        
+
         # Extract likelihood metrics from Stage B (same audio encoder)
         metrics_dict["likelihood"] = {
             "metrics": {
                 "likelihood_probe": results_b["metrics"]["likelihood_probe"],
                 "likelihood_rauc": results_b["metrics"]["likelihood_rauc"],
                 "likelihood_nmi": results_b["metrics"]["likelihood_nmi"],
+                "likelihood_map": results_b["metrics"]["likelihood_map"],
+                "likelihood_cmap": results_b["metrics"]["likelihood_cmap"],
                 "likelihood_tp": results_b["metrics"]["likelihood_tp"],
                 "likelihood_fp": results_b["metrics"]["likelihood_fp"],
                 "likelihood_fn": results_b["metrics"]["likelihood_fn"],
@@ -708,7 +836,7 @@ def main():
         }
     else:
         print(f"Warning: Stage B checkpoint not found at {args.checkpoint_stage_b}")
-    
+
     # Prior model (evaluate separately)
     print("\n" + "="*60)
     print("Evaluating Prior Model")
@@ -718,7 +846,7 @@ def main():
         torch.cuda.empty_cache()
         import time
         time.sleep(1)  # Small delay to let CUDA settle
-    
+
     # Create a dummy model that just returns prior
     audio_encoder_prior = NatureLMAudioEncoder(use_qformer=args.use_qformer, pooling=args.pooling)
     prior_only_model = WeightedFusionModel(
@@ -731,26 +859,26 @@ def main():
     with torch.no_grad():
         prior_only_model.w_weight.fill_(10.0)
         prior_only_model.temperature.fill_(1.0)
-    results_prior = evaluate_model(prior_only_model, val_loader, device, prior_model, idx_to_label)
+    results_prior = evaluate_model(prior_only_model, val_loader, device, prior_model, idx_to_label, num_classes)
     metrics_dict["prior"] = results_prior
-    
+
     # Clean up Prior model
     del prior_only_model
     del audio_encoder_prior
     if device == "cuda" and torch.cuda.is_available():
         torch.cuda.empty_cache()
-    
+
     # Create visualizations
     print("\n" + "="*60)
     print("Creating Visualizations")
     print("="*60)
-    
+
     # Comparison table
     plot_comparison_table(metrics_dict, output_dir / "comparison_table.png")
-    
+
     # Confusion matrices
     plot_confusion_matrices(metrics_dict, output_dir / "confusion_matrices.png")
-    
+
     # Pathological examples (use Stage B if available, else Stage A)
     if "stage_b" in metrics_dict:
         results = metrics_dict["stage_b"]
@@ -761,7 +889,7 @@ def main():
     else:
         print("No posterior model available for pathological examples")
         results = None
-    
+
     if results is not None:
         plot_pathological_examples(
             results["audio_logits"],
@@ -774,7 +902,7 @@ def main():
             output_dir,
             num_examples=args.num_examples
         )
-    
+
     print("\n" + "="*60)
     print("Evaluation Complete!")
     print("="*60)

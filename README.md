@@ -6,15 +6,16 @@ Official implementation of **FINCH**, a framework for bioacoustic species identi
 
 ## Installation
 
-You'll need Python 3.10+, a [HuggingFace](https://huggingface.co/) account with access to [Meta Llama 3.1 8B Instruct](https://huggingface.co/meta-llama/Meta-Llama-3.1-8B-Instruct) (required by NatureLM-audio), and a CUDA GPU (recommended).
+You'll need Python 3.10+, [uv](https://docs.astral.sh/uv/), a [HuggingFace](https://huggingface.co/) account with access to [Meta Llama 3.1 8B Instruct](https://huggingface.co/meta-llama/Meta-Llama-3.1-8B-Instruct) (required by NatureLM-audio), and a CUDA GPU (recommended).
 
 ```bash
-cd NatureLM-audio
-pip install -r requirements.txt
-pip install scikit-learn seaborn h5py rasterio matplotlib pandas soundfile resampy tqdm wandb
+# Install dependencies
+uv sync
 
-# GPU support
-pip install torch torchaudio --index-url https://download.pytorch.org/whl/cu121
+# NatureLM-audio dependencies
+cd NatureLM-audio
+uv pip install -r requirements.txt
+cd ..
 
 # HuggingFace login
 huggingface-cli login
@@ -44,7 +45,7 @@ Training is split into two stages, both via `Scripts/train_weighted_fusion.py`.
 ```bash
 cd Scripts
 
-python train_weighted_fusion.py \
+uv run python train_weighted_fusion.py \
     --stage A \
     --data_dir ../Data/cbi \
     --priors_cache ../Data/cbi/priors_cache_temp_1766584745.h5 \
@@ -57,7 +58,7 @@ python train_weighted_fusion.py \
 **Stage B** replaces the scalar weight with a gating network `w(a, x, t)` that adapts the fusion weight based on audio confidence, prior confidence, location, and time:
 
 ```bash
-python train_weighted_fusion.py \
+uv run python train_weighted_fusion.py \
     --stage B \
     --data_dir ../Data/cbi \
     --priors_cache ../Data/cbi/priors_cache_temp_1766584745.h5 \
@@ -72,19 +73,26 @@ To warm-start Stage B from a Stage A checkpoint, add `--resume ../checkpoints_fu
 
 ## Evaluation
 
-`Scripts/evaluate_models.py` benchmarks four configurations -- prior-only, audio-only, Stage A posterior, and Stage B posterior -- reporting Probe accuracy, R-AUC, and NMI.
+`Scripts/evaluate_models_fast.py` benchmarks prior-only, audio-only (likelihood), and posterior configurations, reporting Probe accuracy, cmAP, R-AUC, and NMI. The encoder is loaded once and features are cached, so evaluating multiple checkpoints is fast.
 
 ```bash
-python evaluate_models.py \
+cd Scripts
+
+uv run python evaluate_models_fast.py \
     --data_dir ../Data/cbi \
     --priors_cache ../Data/cbi/priors_cache_temp_1766584745.h5 \
-    --checkpoint_stage_a ../checkpoints_fusion_stage_a/checkpoint_epoch30.pth \
-    --checkpoint_stage_b ../checkpoints_fusion/best_model.pth \
-    --output_dir ../evaluation_results \
+    --checkpoints ../checkpoints_fusion_stage_a/best_model.pth \
+                  ../checkpoints_fusion/best_model.pth \
     --batch_size 64 --device cuda --num_workers 4
 ```
 
-Results are saved to `evaluation_results/`: a metrics table (`comparison_table.png`), confusion matrices, pathological examples, and a CSV with all numbers.
+Or use the wrapper script:
+
+```bash
+bash Scripts/eval_cbi.sh
+```
+
+Results are printed as a summary table and saved to `eval_results.pth`.
 
 ## Notes
 
